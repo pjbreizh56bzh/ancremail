@@ -1,0 +1,137 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Plan {
+  FREE
+  PRO
+  SCALE
+}
+
+enum Direction {
+  INBOUND
+  OUTBOUND
+}
+
+enum MessageStatus {
+  RECEIVED
+  QUEUED
+  SENT
+  FAILED
+}
+
+model User {
+  id                   String    @id @default(cuid())
+  email                String    @unique
+  passwordHash         String
+  emailVerifiedAt      DateTime?
+  plan                 Plan      @default(FREE)
+  stripeCustomerId     String?   @unique
+  stripeSubscriptionId String?   @unique
+  subscriptionStatus   String?
+  failedLogins         Int       @default(0)
+  lockedUntil          DateTime?
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  sessions           Session[]
+  apiKeys            ApiKey[]
+  inboxes            Inbox[]
+  auditLogs          AuditLog[]
+  verificationTokens VerificationToken[]
+}
+
+model Session {
+  // id = SHA-256 du jeton du cookie : une fuite de la base ne donne aucun cookie valide.
+  id        String   @id
+  userId    String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  userAgent String?
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model VerificationToken {
+  tokenHash String   @id
+  userId    String
+  expiresAt DateTime
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model ApiKey {
+  id         String    @id @default(cuid())
+  userId     String
+  name       String
+  prefix     String
+  keyHash    String    @unique
+  lastUsedAt DateTime?
+  expiresAt  DateTime?
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model Inbox {
+  id          String    @id @default(cuid())
+  userId      String
+  // Une adresse n'est JAMAIS réattribuée (suppression logique) : évite qu'un nouveau
+  // propriétaire reçoive les mails (ex : réinitialisation de mot de passe) de l'ancien.
+  address     String    @unique
+  displayName String?
+  deletedAt   DateTime?
+  createdAt   DateTime  @default(now())
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages    Message[]
+
+  @@index([userId, deletedAt])
+}
+
+model Message {
+  id                String        @id @default(cuid())
+  inboxId           String
+  direction         Direction
+  status            MessageStatus
+  fromAddress       String
+  toAddresses       String[]
+  subject           String
+  text              String?
+  html              String?
+  providerMessageId String?       @unique
+  idempotencyKey    String?
+  error             String?
+  readAt            DateTime?
+  createdAt         DateTime      @default(now())
+  inbox             Inbox         @relation(fields: [inboxId], references: [id], onDelete: Cascade)
+
+  @@unique([inboxId, idempotencyKey])
+  @@index([inboxId, createdAt])
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  userId    String
+  action    String
+  detail    String?
+  ip        String?
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+}
+
+model StripeEvent {
+  // Idempotence des webhooks Stripe : chaque événement n'est traité qu'une fois.
+  id          String   @id
+  processedAt DateTime @default(now())
+}
