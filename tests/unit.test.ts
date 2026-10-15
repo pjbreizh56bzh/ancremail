@@ -123,6 +123,19 @@ describe("adaptateur Mailgun", () => {
   });
 });
 
+describe("configuration", () => {
+  it("déduit APP_URL du domaine de production Vercel s'il est absent", () => {
+    const prev = process.env.APP_URL;
+    delete process.env.APP_URL;
+    process.env.VERCEL_PROJECT_PRODUCTION_URL = "ancremail.vercel.app";
+    resetEnvCache();
+    expect(env().APP_URL).toBe("https://ancremail.vercel.app");
+    process.env.APP_URL = prev;
+    delete process.env.VERCEL_PROJECT_PRODUCTION_URL;
+    resetEnvCache();
+  });
+});
+
 describe("configuration bancaire", () => {
   it("valide les IBAN (modulo 97) et refuse une faute de frappe", () => {
     expect(isValidIban("FR7630006000011234567890189")).toBe(true);
