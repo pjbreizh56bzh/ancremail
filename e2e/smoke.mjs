@@ -1,5 +1,6 @@
 // Test de bout en bout dans un vrai navigateur (Chromium) contre l'app démarrée.
-// Usage : BASE_URL=http://localhost:3100 INBOUND_WEBHOOK_SECRET=... DATABASE_URL=... node e2e/smoke.mjs
+// Usage : BASE_URL=... INBOUND_WEBHOOK_SECRET=... DATABASE_URL=... E2E_ADMIN_EMAIL=<un email de ADMIN_EMAILS> node e2e/smoke.mjs
+// Le serveur doit avoir BANK_IBAN=FR7630006000011234567890189 (IBAN d'exemple) pour l'étape paiement.
 import { chromium } from "playwright";
 import { createHmac } from "node:crypto";
 import { PrismaClient } from "@prisma/client";
@@ -7,6 +8,7 @@ import { PrismaClient } from "@prisma/client";
 const BASE = process.env.BASE_URL ?? "http://localhost:3000";
 const SECRET = process.env.INBOUND_WEBHOOK_SECRET;
 const DOMAIN = process.env.MAIL_DOMAIN ?? "agents.localhost";
+const ADMIN_EMAIL = process.env.E2E_ADMIN_EMAIL ?? `admin-${Date.now()}@exemple.fr`;
 const db = new PrismaClient();
 const problems = [];
 const step = (s) => console.log("✓", s);
@@ -108,14 +110,45 @@ try {
   assert(c.httpOnly && c.sameSite === "Lax", "cookie de session mal protégé");
   step("anti-CSRF + cookie httpOnly/SameSite");
 
-  // 9. Autres pages
+  // 9. Paiement par virement : commande côté client, validation côté administrateur
+  await page.goto(BASE + "/dashboard/billing");
+  await page.getByRole("button", { name: "Commander Pro (1 mois)" }).click();
+  const ref = (await page.locator("dd.font-mono", { hasText: "ANCRE-" }).textContent()).replace("Copier", "").trim();
+  assert(/^ANCRE-[A-Z0-9]{8}$/.test(ref), "référence de virement absente : " + ref);
+  assert(await page.getByText("FR76 3000 6000 0112 3456 7890 189").isVisible(), "IBAN non affiché");
+  const clientCookies = (await page.context().cookies()).map((c) => `${c.name}=${c.value}`).join("; ");
+  const notAdmin = await fetch(BASE + "/dashboard/admin", { headers: { cookie: clientCookies } });
+  assert(notAdmin.status === 404, `page admin accessible à un client (${notAdmin.status})`);
+  const notAdminApi = await fetch(BASE + "/api/console/admin/orders/x", {
+    method: "POST", headers: { cookie: clientCookies, origin: BASE, "content-type": "application/json" }, body: '{"action":"confirm"}',
+  });
+  assert(notAdminApi.status === 404, `API admin accessible à un client (${notAdminApi.status})`);
+
+  const adminCtx = await browser.newContext();
+  const admin = await adminCtx.newPage();
+  admin.on("pageerror", (e) => problems.push(e.message));
+  await admin.goto(BASE + "/signup");
+  await admin.fill("#email", ADMIN_EMAIL);
+  await admin.fill("#password", "motdepasse-admin-123");
+  await admin.click("form button");
+  await admin.waitForURL("**/dashboard");
+  await admin.goto(BASE + "/dashboard/admin");
+  admin.on("dialog", (d) => d.accept());
+  await admin.locator("tr", { hasText: ref }).getByRole("button", { name: "Virement reçu" }).click();
+  await admin.getByText("Aucun virement en attente.").waitFor();
+  await adminCtx.close();
+  await page.goto(BASE + "/dashboard/billing");
+  assert(await page.getByText(/Payé jusqu'au/).isVisible(), "plan non activé après validation");
+  step("commande par virement, validation admin, plan Pro activé");
+
+  // 10. Autres pages
   for (const p of ["/dashboard", "/dashboard/billing", "/dashboard/activity", "/docs"]) {
     const r = await page.goto(BASE + p);
     assert(r.status() === 200, `${p} -> ${r.status()}`);
   }
   step("pages abonnement, activité, documentation");
 
-  // 10. Déconnexion
+  // 11. Déconnexion
   await page.goto(BASE + "/dashboard");
   await page.getByRole("button", { name: "Déconnexion" }).click();
   await page.waitForURL("**/login");

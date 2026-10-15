@@ -7,7 +7,7 @@ import type { Plan } from "@prisma/client";
 export async function resetDb() {
   resetRateLimits();
   await db.$executeRawUnsafe(
-    'TRUNCATE "Message","Inbox","ApiKey","Session","VerificationToken","AuditLog","StripeEvent","User" CASCADE',
+    'TRUNCATE "Message","Inbox","ApiKey","Session","VerificationToken","AuditLog","Order","User" CASCADE',
   );
 }
 

@@ -1,5 +1,6 @@
 import { db } from "./db";
 import { randomToken, sha256 } from "./crypto";
+import { refreshPlan } from "./billing";
 
 export const API_KEY_PREFIX = "amk_";
 export const MAX_KEYS_PER_USER = 10;
@@ -19,5 +20,5 @@ export async function findUserByApiKey(key: string) {
   if (!record.lastUsedAt || Date.now() - record.lastUsedAt.getTime() > 60_000) {
     await db.apiKey.update({ where: { id: record.id }, data: { lastUsedAt: new Date() } }).catch(() => {});
   }
-  return { user: record.user, apiKeyId: record.id };
+  return { user: await refreshPlan(record.user), apiKeyId: record.id };
 }

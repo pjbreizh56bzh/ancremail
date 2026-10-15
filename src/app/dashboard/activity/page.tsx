@@ -12,7 +12,12 @@ const labels: Record<string, string> = {
   "api_key.revoke": "Clé API révoquée",
   "inbox.create": "Boîte créée",
   "inbox.delete": "Boîte supprimée",
-  "billing.subscription": "Abonnement mis à jour",
+  "billing.order_created": "Commande créée",
+  "billing.order_cancelled": "Commande annulée",
+  "billing.payment_confirmed": "Paiement reçu, plan activé",
+  "billing.expired": "Fin de période payée",
+  "admin.payment_confirmed": "Virement validé (admin)",
+  "admin.order_rejected": "Commande rejetée (admin)",
 };
 
 export default async function ActivityPage() {

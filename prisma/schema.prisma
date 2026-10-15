@@ -13,6 +13,12 @@ enum Plan {
   SCALE
 }
 
+enum OrderStatus {
+  PENDING
+  PAID
+  CANCELLED
+}
+
 enum Direction {
   INBOUND
   OUTBOUND
@@ -31,9 +37,8 @@ model User {
   passwordHash         String
   emailVerifiedAt      DateTime?
   plan                 Plan      @default(FREE)
-  stripeCustomerId     String?   @unique
-  stripeSubscriptionId String?   @unique
-  subscriptionStatus   String?
+  // Fin de la période payée ; à échéance, le compte repasse automatiquement en FREE.
+  planExpiresAt        DateTime?
   failedLogins         Int       @default(0)
   lockedUntil          DateTime?
   createdAt            DateTime  @default(now())
@@ -44,6 +49,7 @@ model User {
   inboxes            Inbox[]
   auditLogs          AuditLog[]
   verificationTokens VerificationToken[]
+  orders             Order[]
 }
 
 model Session {
@@ -130,8 +136,20 @@ model AuditLog {
   @@index([userId, createdAt])
 }
 
-model StripeEvent {
-  // Idempotence des webhooks Stripe : chaque événement n'est traité qu'une fois.
-  id          String   @id
-  processedAt DateTime @default(now())
+model Order {
+  id          String      @id @default(cuid())
+  userId      String
+  plan        Plan
+  months      Int         @default(1)
+  amountCents Int
+  // Référence à recopier dans le libellé du virement pour rapprocher le paiement.
+  reference   String      @unique
+  status      OrderStatus @default(PENDING)
+  createdAt   DateTime    @default(now())
+  paidAt      DateTime?
+  confirmedBy String?
+  user        User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([status, createdAt])
+  @@index([userId, createdAt])
 }

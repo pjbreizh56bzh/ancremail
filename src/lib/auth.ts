@@ -4,6 +4,7 @@ import { db } from "./db";
 import { env } from "./env";
 import { randomToken, sha256 } from "./crypto";
 import { HttpError } from "./http";
+import { refreshPlan } from "./billing";
 
 const SESSION_TTL_MS = 7 * 24 * 3600 * 1000;
 
@@ -43,7 +44,7 @@ export async function userFromSessionToken(token: string | undefined): Promise<U
     await db.session.delete({ where: { id: session.id } }).catch(() => {});
     return null;
   }
-  return session.user;
+  return refreshPlan(session.user);
 }
 
 /** Utilisateur courant (pages serveur). */

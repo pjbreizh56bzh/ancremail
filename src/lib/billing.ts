@@ -1,113 +1,130 @@
-import Stripe from "stripe";
-import type { Plan, User } from "@prisma/client";
+import type { Order, Plan, User } from "@prisma/client";
+import { randomBytes } from "node:crypto";
 import { db } from "./db";
 import { env } from "./env";
 import { HttpError } from "./http";
 import { audit } from "./audit";
+import { PLANS } from "./plans";
 
-let client: Stripe | null = null;
+const MAX_PENDING_ORDERS = 3;
+const ORDER_TTL_DAYS = 14;
+// Alphabet sans caractères ambigus (0/O, 1/I/L) pour une référence facile à recopier.
+const REF_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
 
-export function stripe(): Stripe {
-  const key = env().STRIPE_SECRET_KEY;
-  if (!key) throw new HttpError(503, "billing_disabled", "Le paiement n'est pas configuré sur ce serveur");
-  client ??= new Stripe(key);
-  return client;
+export function newReference(): string {
+  const bytes = randomBytes(8);
+  let ref = "";
+  for (const b of bytes) ref += REF_ALPHABET[b % REF_ALPHABET.length];
+  return `ANCRE-${ref}`;
 }
 
-/** Réservé aux tests. */
-export function setStripeClient(c: Stripe | null) {
-  client = c;
-}
-
-export function priceForPlan(plan: Plan): string {
+export function bankDetails() {
   const e = env();
-  const price = plan === "PRO" ? e.STRIPE_PRICE_PRO : plan === "SCALE" ? e.STRIPE_PRICE_SCALE : "";
-  if (!price) throw new HttpError(400, "invalid_plan", "Plan indisponible");
-  return price;
+  if (!e.BANK_IBAN || !e.BANK_ACCOUNT_HOLDER) return null;
+  return { holder: e.BANK_ACCOUNT_HOLDER, iban: e.BANK_IBAN, bic: e.BANK_BIC || null };
 }
 
-export function planForPrice(priceId: string | undefined | null): Plan {
-  const e = env();
-  if (priceId && priceId === e.STRIPE_PRICE_PRO) return "PRO";
-  if (priceId && priceId === e.STRIPE_PRICE_SCALE) return "SCALE";
-  return "FREE";
+export function formatIban(iban: string) {
+  return iban.replace(/(.{4})/g, "$1 ").trim();
 }
 
-export async function createCheckout(user: User, plan: Plan) {
+export function isAdmin(user: Pick<User, "email">) {
+  return env().ADMIN_EMAILS.includes(user.email.toLowerCase());
+}
+
+export function requireAdmin(user: User) {
+  // 404 plutôt que 403 : on ne révèle pas l'existence de l'espace d'administration.
+  if (!isAdmin(user)) throw new HttpError(404, "not_found", "Introuvable");
+}
+
+/** Repasse le compte en FREE si la période payée est terminée. Appelé à chaque authentification. */
+export async function refreshPlan<T extends User>(user: T): Promise<T> {
+  if (user.plan !== "FREE" && user.planExpiresAt && user.planExpiresAt <= new Date()) {
+    await db.user.update({ where: { id: user.id }, data: { plan: "FREE", planExpiresAt: null } });
+    await audit(user.id, "billing.expired", `${user.plan} -> FREE`);
+    return { ...user, plan: "FREE", planExpiresAt: null };
+  }
+  return user;
+}
+
+export async function createOrder(user: User, plan: Plan, months: number) {
   if (plan === "FREE") throw new HttpError(400, "invalid_plan", "Plan invalide");
-  if (user.stripeSubscriptionId && user.subscriptionStatus === "active") {
-    throw new HttpError(409, "already_subscribed", "Abonnement déjà actif : utilisez le portail de facturation pour changer de plan");
+  if (!bankDetails()) throw new HttpError(503, "billing_disabled", "Le paiement par virement n'est pas encore configuré");
+  const pending = await db.order.count({ where: { userId: user.id, status: "PENDING" } });
+  if (pending >= MAX_PENDING_ORDERS) {
+    throw new HttpError(409, "too_many_pending", "Vous avez déjà des commandes en attente : réglez ou annulez-les d'abord");
   }
-  const session = await stripe().checkout.sessions.create({
-    mode: "subscription",
-    line_items: [{ price: priceForPlan(plan), quantity: 1 }],
-    client_reference_id: user.id,
-    customer: user.stripeCustomerId ?? undefined,
-    customer_email: user.stripeCustomerId ? undefined : user.email,
-    metadata: { userId: user.id, plan },
-    subscription_data: { metadata: { userId: user.id } },
-    success_url: `${env().APP_URL}/dashboard/billing?status=success`,
-    cancel_url: `${env().APP_URL}/dashboard/billing?status=cancel`,
-  });
-  if (!session.url) throw new HttpError(502, "stripe_error", "Stripe n'a pas renvoyé d'URL");
-  return session.url;
-}
-
-export async function createPortal(user: User) {
-  if (!user.stripeCustomerId) throw new HttpError(400, "no_customer", "Aucun abonnement à gérer");
-  const session = await stripe().billingPortal.sessions.create({
-    customer: user.stripeCustomerId,
-    return_url: `${env().APP_URL}/dashboard/billing`,
-  });
-  return session.url;
-}
-
-async function applySubscription(sub: Stripe.Subscription) {
-  const customerId = typeof sub.customer === "string" ? sub.customer : sub.customer.id;
-  const userId = sub.metadata?.userId;
-  const user = userId
-    ? await db.user.findUnique({ where: { id: userId } })
-    : await db.user.findUnique({ where: { stripeCustomerId: customerId } });
-  if (!user) return;
-  const activeLike = ["active", "trialing", "past_due"].includes(sub.status);
-  const plan = activeLike ? planForPrice(sub.items.data[0]?.price?.id) : "FREE";
-  await db.user.update({
-    where: { id: user.id },
-    data: {
-      plan,
-      stripeCustomerId: customerId,
-      stripeSubscriptionId: sub.status === "canceled" ? null : sub.id,
-      subscriptionStatus: sub.status,
-    },
-  });
-  await audit(user.id, "billing.subscription", `${sub.status} -> ${plan}`);
-}
-
-/** Traite un événement Stripe déjà vérifié. Idempotent via la table StripeEvent. */
-export async function handleStripeEvent(event: Stripe.Event) {
-  const already = await db.stripeEvent.findUnique({ where: { id: event.id } });
-  if (already) return { duplicate: true };
-
-  switch (event.type) {
-    case "checkout.session.completed": {
-      const s = event.data.object as Stripe.Checkout.Session;
-      const userId = s.client_reference_id ?? s.metadata?.userId;
-      if (userId && s.subscription) {
-        const subId = typeof s.subscription === "string" ? s.subscription : s.subscription.id;
-        const sub = await stripe().subscriptions.retrieve(subId);
-        sub.metadata = { ...sub.metadata, userId };
-        await applySubscription(sub);
-      }
-      break;
+  const amountCents = PLANS[plan].priceEurMonthly * 100 * months;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      const order = await db.order.create({ data: { userId: user.id, plan, months, amountCents, reference: newReference() } });
+      await audit(user.id, "billing.order_created", `${order.reference} ${plan} x${months}`);
+      return order;
+    } catch (err) {
+      if ((err as { code?: string }).code !== "P2002") throw err; // collision de référence : on réessaie
     }
-    case "customer.subscription.created":
-    case "customer.subscription.updated":
-    case "customer.subscription.deleted":
-      await applySubscription(event.data.object as Stripe.Subscription);
-      break;
-    default:
-      break;
   }
-  await db.stripeEvent.create({ data: { id: event.id } }).catch(() => {});
-  return { duplicate: false };
+  throw new HttpError(500, "internal_error", "Impossible de générer une référence");
+}
+
+export async function cancelOwnOrder(user: User, orderId: string) {
+  const res = await db.order.updateMany({
+    where: { id: orderId.slice(0, 64), userId: user.id, status: "PENDING" },
+    data: { status: "CANCELLED" },
+  });
+  if (res.count === 0) throw new HttpError(404, "not_found", "Commande introuvable ou déjà traitée");
+  await audit(user.id, "billing.order_cancelled", orderId);
+}
+
+/** L'administrateur confirme avoir reçu le virement : le plan est activé ou prolongé. */
+export async function confirmOrder(admin: User, orderId: string, ip?: string) {
+  requireAdmin(admin);
+  return db.$transaction(async (tx) => {
+    // Passage PENDING -> PAID atomique : un double clic ne prolonge jamais deux fois.
+    const res = await tx.order.updateMany({
+      where: { id: orderId.slice(0, 64), status: "PENDING" },
+      data: { status: "PAID", paidAt: new Date(), confirmedBy: admin.email },
+    });
+    if (res.count === 0) throw new HttpError(409, "not_pending", "Commande introuvable ou déjà traitée");
+    const order = await tx.order.findUniqueOrThrow({ where: { id: orderId }, include: { user: true } });
+    const now = new Date();
+    const sameActivePlan = order.user.plan === order.plan && order.user.planExpiresAt && order.user.planExpiresAt > now;
+    const start = sameActivePlan ? order.user.planExpiresAt! : now;
+    const expires = new Date(start);
+    expires.setUTCMonth(expires.getUTCMonth() + order.months);
+    await tx.user.update({ where: { id: order.userId }, data: { plan: order.plan, planExpiresAt: expires } });
+    await tx.auditLog.createMany({
+      data: [
+        { userId: order.userId, action: "billing.payment_confirmed", detail: `${order.reference} ${order.plan} jusqu'au ${expires.toISOString().slice(0, 10)}` },
+        { userId: admin.id, action: "admin.payment_confirmed", detail: `${order.reference} (${order.user.email})`, ip },
+      ],
+    });
+    return { order, expires };
+  });
+}
+
+export async function rejectOrder(admin: User, orderId: string, ip?: string) {
+  requireAdmin(admin);
+  const res = await db.order.updateMany({ where: { id: orderId.slice(0, 64), status: "PENDING" }, data: { status: "CANCELLED", confirmedBy: admin.email } });
+  if (res.count === 0) throw new HttpError(409, "not_pending", "Commande introuvable ou déjà traitée");
+  await audit(admin.id, "admin.order_rejected", orderId, ip);
+}
+
+/** Annule les commandes restées sans paiement trop longtemps. */
+export async function expireStaleOrders() {
+  const cutoff = new Date(Date.now() - ORDER_TTL_DAYS * 86400_000);
+  return db.order.updateMany({ where: { status: "PENDING", createdAt: { lt: cutoff } }, data: { status: "CANCELLED" } });
+}
+
+export function serializeOrder(o: Order) {
+  return {
+    id: o.id,
+    plan: o.plan,
+    months: o.months,
+    amountEur: o.amountCents / 100,
+    reference: o.reference,
+    status: o.status.toLowerCase(),
+    createdAt: o.createdAt.toISOString(),
+    paidAt: o.paidAt?.toISOString() ?? null,
+  };
 }

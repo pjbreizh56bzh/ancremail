@@ -5,7 +5,8 @@ import { createInboxSchema, credentialsSchema, sendMessageSchema } from "@/lib/v
 import { signInbound, verifyInboundSignature } from "@/lib/mail/mock";
 import { MailgunProvider } from "@/lib/mail/mailgun";
 import { hmacSha256Hex } from "@/lib/crypto";
-import { env, resetEnvCache } from "@/lib/env";
+import { env, isValidIban, resetEnvCache } from "@/lib/env";
+import { newReference } from "@/lib/billing";
 import { generateApiKey } from "@/lib/api-keys";
 
 describe("mots de passe", () => {
@@ -122,14 +123,24 @@ describe("adaptateur Mailgun", () => {
   });
 });
 
-describe("configuration", () => {
-  it("refuse une clé Stripe live sans autorisation explicite", () => {
-    const prev = process.env.STRIPE_SECRET_KEY;
-    process.env.STRIPE_SECRET_KEY = "sk_live_abc";
+describe("configuration bancaire", () => {
+  it("valide les IBAN (modulo 97) et refuse une faute de frappe", () => {
+    expect(isValidIban("FR7630006000011234567890189")).toBe(true);
+    expect(isValidIban("FR7630006000011234567890188")).toBe(false);
+    expect(isValidIban("pas-un-iban")).toBe(false);
+  });
+  it("normalise l'IBAN de la configuration et refuse un IBAN invalide au démarrage", () => {
+    expect(env().BANK_IBAN).toBe("FR7630006000011234567890189");
+    const prev = process.env.BANK_IBAN;
+    process.env.BANK_IBAN = "FR7630006000011234567890188";
     resetEnvCache();
-    expect(() => env()).toThrow(/live/);
-    process.env.STRIPE_SECRET_KEY = prev;
+    expect(() => env()).toThrow(/BANK_IBAN/);
+    process.env.BANK_IBAN = prev;
     resetEnvCache();
-    expect(env().STRIPE_SECRET_KEY).toBe(prev);
+  });
+  it("génère des références lisibles et uniques", () => {
+    const refs = new Set(Array.from({ length: 500 }, () => newReference()));
+    expect(refs.size).toBe(500);
+    for (const r of refs) expect(r).toMatch(/^ANCRE-[2-9A-HJKMNP-Z]{8}$/);
   });
 });

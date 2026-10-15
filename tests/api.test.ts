@@ -1,5 +1,4 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import Stripe from "stripe";
 import { db } from "@/lib/db";
 import { ctx, makeUser, req, resetDb } from "./helpers";
 import * as inboxesRoute from "@/app/api/v1/inboxes/route";
@@ -8,10 +7,10 @@ import * as messagesRoute from "@/app/api/v1/inboxes/[inboxId]/messages/route";
 import * as messageRoute from "@/app/api/v1/inboxes/[inboxId]/messages/[messageId]/route";
 import * as meRoute from "@/app/api/v1/me/route";
 import * as inboundRoute from "@/app/api/webhooks/inbound/route";
-import * as stripeRoute from "@/app/api/webhooks/stripe/route";
 import { signInbound, sentMockMails } from "@/lib/mail/mock";
 import { login, signup, verifyEmail } from "@/lib/users";
-import { handleStripeEvent, setStripeClient } from "@/lib/billing";
+import { confirmOrder, createOrder, refreshPlan, rejectOrder } from "@/lib/billing";
+import { PLANS } from "@/lib/plans";
 
 const SECRET = "test-inbound-secret-0123456789abcdef0123";
 
@@ -241,40 +240,65 @@ describe("comptes", () => {
   });
 });
 
-describe("facturation Stripe", () => {
-  const stripeLib = new Stripe("sk_test_dummy");
-
-  function subEvent(id: string, type: string, sub: Partial<Stripe.Subscription>) {
-    return { id, type, data: { object: { object: "subscription", ...sub } } } as unknown as Stripe.Event;
-  }
-
-  it("active, modifie puis résilie un abonnement ; ignore les événements rejoués", async () => {
+describe("paiement par virement", () => {
+  it("crée une commande avec montant et référence, limitée à 3 en attente", async () => {
     const { user } = await makeUser();
-    const base = { id: "sub_1", customer: "cus_1", metadata: { userId: user.id } };
-    const items = (price: string) => ({ data: [{ price: { id: price } }] }) as unknown as Stripe.Subscription["items"];
+    const order = await createOrder(user, "PRO", 1);
+    expect(order.amountCents).toBe(PLANS.PRO.priceEurMonthly * 100);
+    expect(order.status).toBe("PENDING");
+    await createOrder(user, "SCALE", 2);
+    await createOrder(user, "PRO", 1);
+    await expect(createOrder(user, "PRO", 1)).rejects.toMatchObject({ status: 409 });
+    await expect(createOrder(user, "FREE", 1)).rejects.toMatchObject({ status: 400 });
+  });
 
-    await handleStripeEvent(subEvent("evt_1", "customer.subscription.created", { ...base, status: "active", items: items("price_pro_test") }));
-    expect((await db.user.findUniqueOrThrow({ where: { id: user.id } })).plan).toBe("PRO");
+  it("seul un administrateur peut valider ; la validation active le plan une seule fois", async () => {
+    const { user } = await makeUser();
+    const { user: intrus } = await makeUser();
+    const { user: admin } = await makeUser({ email: "admin@ancremail.test" });
+    const order = await createOrder(user, "PRO", 1);
 
-    const dup = await handleStripeEvent(subEvent("evt_1", "customer.subscription.created", { ...base, status: "active", items: items("price_pro_test") }));
-    expect(dup.duplicate).toBe(true);
+    await expect(confirmOrder(intrus, order.id)).rejects.toMatchObject({ status: 404 });
+    expect((await db.user.findUniqueOrThrow({ where: { id: user.id } })).plan).toBe("FREE");
 
-    await handleStripeEvent(subEvent("evt_2", "customer.subscription.updated", { ...base, status: "active", items: items("price_scale_test") }));
-    expect((await db.user.findUniqueOrThrow({ where: { id: user.id } })).plan).toBe("SCALE");
-
-    await handleStripeEvent(subEvent("evt_3", "customer.subscription.deleted", { ...base, status: "canceled", items: items("price_scale_test") }));
+    const { expires } = await confirmOrder(admin, order.id);
     const after = await db.user.findUniqueOrThrow({ where: { id: user.id } });
-    expect(after.plan).toBe("FREE");
-    expect(after.stripeSubscriptionId).toBeNull();
+    expect(after.plan).toBe("PRO");
+    expect(after.planExpiresAt?.getTime()).toBe(expires.getTime());
+    const days = (expires.getTime() - Date.now()) / 86400_000;
+    expect(days).toBeGreaterThan(27);
+    expect(days).toBeLessThan(32);
+
+    // Double clic : refusé, la période n'est pas prolongée deux fois.
+    await expect(confirmOrder(admin, order.id)).rejects.toMatchObject({ status: 409 });
+    expect((await db.user.findUniqueOrThrow({ where: { id: user.id } })).planExpiresAt?.getTime()).toBe(expires.getTime());
   });
 
-  it("le webhook rejette une signature invalide et accepte une signature valide", async () => {
-    setStripeClient(stripeLib);
-    const payload = JSON.stringify({ id: "evt_x", object: "event", type: "invoice.paid", data: { object: {} } });
-    const bad = await stripeRoute.POST(new Request("http://x", { method: "POST", headers: { "stripe-signature": "t=1,v1=abc" }, body: payload }));
-    expect(bad.status).toBe(400);
-    const header = stripeLib.webhooks.generateTestHeaderString({ payload, secret: "whsec_test_dummy" });
-    const ok = await stripeRoute.POST(new Request("http://x", { method: "POST", headers: { "stripe-signature": header }, body: payload }));
-    expect(ok.status).toBe(200);
+  it("une nouvelle commande du même plan prolonge depuis la fin de la période en cours", async () => {
+    const { user } = await makeUser();
+    const { user: admin } = await makeUser({ email: "admin@ancremail.test" });
+    const first = await confirmOrder(admin, (await createOrder(user, "PRO", 1)).id);
+    const second = await confirmOrder(admin, (await createOrder(user, "PRO", 1)).id);
+    const gapDays = (second.expires.getTime() - first.expires.getTime()) / 86400_000;
+    expect(gapDays).toBeGreaterThanOrEqual(28);
   });
+
+  it("le plan repasse en gratuit à échéance", async () => {
+    const { user, key } = await makeUser({ plan: "PRO" });
+    await db.user.update({ where: { id: user.id }, data: { planExpiresAt: new Date(Date.now() - 1000) } });
+    const me = await (await meRoute.GET(req("/api/v1/me", { key }))).json();
+    expect(me.plan.id).toBe("FREE");
+    const refreshed = await refreshPlan(await db.user.findUniqueOrThrow({ where: { id: user.id } }));
+    expect(refreshed.plan).toBe("FREE");
+  });
+
+  it("une commande rejetée n'active rien", async () => {
+    const { user } = await makeUser();
+    const { user: admin } = await makeUser({ email: "admin@ancremail.test" });
+    const order = await createOrder(user, "SCALE", 1);
+    await rejectOrder(admin, order.id);
+    await expect(confirmOrder(admin, order.id)).rejects.toMatchObject({ status: 409 });
+    expect((await db.user.findUniqueOrThrow({ where: { id: user.id } })).plan).toBe("FREE");
+  });
+
 });

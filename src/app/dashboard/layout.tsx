@@ -4,6 +4,7 @@ import { currentUser } from "@/lib/auth";
 import { Logo } from "@/components/Logo";
 import { LogoutButton } from "@/components/LogoutButton";
 import { PLANS } from "@/lib/plans";
+import { isAdmin } from "@/lib/billing";
 
 const nav = [
   { href: "/dashboard", label: "Vue d'ensemble" },
@@ -22,7 +23,7 @@ export default async function DashboardLayout({ children }: { children: React.Re
       <aside className="border-b border-slate-200 bg-white p-4 md:w-60 md:border-b-0 md:border-r">
         <Logo href="/dashboard" />
         <nav className="mt-6 flex flex-wrap gap-1 md:flex-col">
-          {nav.map((n) => (
+          {[...nav, ...(isAdmin(user) ? [{ href: "/dashboard/admin", label: "Paiements à valider" }] : [])].map((n) => (
             <Link key={n.href} href={n.href} className="rounded-lg px-3 py-2 text-sm text-slate-700 hover:bg-foam hover:text-sea">
               {n.label}
             </Link>

@@ -62,7 +62,7 @@ export default function Home() {
 
       <section id="tarifs" className="mx-auto max-w-6xl px-4 py-16">
         <h2 className="text-center text-3xl font-bold text-ink">Tarifs simples</h2>
-        <p className="mt-2 text-center text-slate-600">Sans engagement, résiliable à tout moment.</p>
+        <p className="mt-2 text-center text-slate-600">Sans engagement : payez au mois par simple virement bancaire.</p>
         <div className="mt-10 grid gap-4 md:grid-cols-3">
           {Object.values(PLANS).map((p) => (
             <div key={p.id} className={`card flex flex-col ${p.id === "PRO" ? "ring-2 ring-sea" : ""}`}>

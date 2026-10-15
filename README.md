@@ -15,7 +15,7 @@ un code entièrement originaux.
 | Console | Vue d'ensemble (quotas), boîtes mail, lecture/envoi, clés API, abonnement, journal d'activité |
 | API REST v1 | `me`, CRUD boîtes, liste/lecture/envoi de messages, pagination par curseur, idempotence |
 | Réception | Webhook entrant signé (fournisseur factice) ou Route Mailgun signée |
-| Facturation | Stripe Checkout (abonnement), portail client, webhooks signés et idempotents |
+| Facturation | Paiement par virement bancaire (ex. compte Deblock) : commande avec référence unique, validation manuelle par l'administrateur, activation pour 1 mois, retour automatique au plan gratuit à échéance |
 | Plans | Gratuit 3 boîtes / 100 envois · Pro 19 € 50 / 10 000 · Scale 99 € 500 / 100 000 (`src/lib/plans.ts`) |
 
 ## Sécurité intégrée
@@ -37,8 +37,9 @@ un code entièrement originaux.
 - **Adresses jamais recyclées** : une boîte supprimée garde son adresse réservée, pour qu'aucun inconnu
   ne reçoive les mails (réinitialisations de mot de passe…) destinés à l'ancien propriétaire.
 - **Webhooks** : signatures HMAC vérifiées à temps constant, fenêtre anti-rejeu de 5 minutes, dédoublonnage.
-- **Paiement** : aucune donnée bancaire ne transite par le serveur (Stripe Checkout) ; les clés `sk_live_`
-  sont refusées tant que `ALLOW_LIVE_PAYMENTS=true` n'est pas posé volontairement.
+- **Paiement** : aucun moyen de paiement n'est saisi sur le site. L'IBAN vient d'une variable d'environnement
+  validée (modulo 97). Seuls les emails listés dans `ADMIN_EMAILS` voient et valident les commandes (404 pour les
+  autres). La validation est atomique, donc un double clic ne prolonge jamais deux fois, et tout est journalisé.
 - **Abus** : l'envoi est bloqué tant que l'email du compte n'est pas vérifié ; quotas mensuels.
 - **Journal d'audit** visible par l'utilisateur (connexions, échecs, clés, boîtes, abonnement).
 - **Dépendances** : `npm audit` → 0 vulnérabilité au moment de la livraison.
@@ -72,14 +73,14 @@ curl -X POST http://localhost:3000/api/webhooks/inbound -H "x-ancre-signature: t
 ```bash
 createdb ancremail_test                                   # base dédiée aux tests
 DATABASE_URL=postgresql://.../ancremail_test npx prisma migrate deploy
-npm test                                                  # 35 tests unitaires + intégration
+npm test                                                  # 40 tests unitaires + intégration
 npm run build && npm start &                              # puis, test navigateur complet :
 BASE_URL=http://localhost:3000 npm run test:e2e           # nécessite `npx playwright install chromium`
 ```
 
 Le test de bout en bout parcourt : inscription → clé API → création de boîte → API Bearer → réception
 signée (et refus d'un faux webhook) → lecture d'un email HTML piégé (script neutralisé) → envoi →
-tentative CSRF bloquée → déconnexion, et échoue à la moindre violation CSP ou erreur JavaScript.
+tentative CSRF bloquée → commande par virement validée par l'admin → déconnexion, et échoue à la moindre violation CSP ou erreur JavaScript.
 
 ## Mise en production
 
@@ -87,11 +88,11 @@ tentative CSRF bloquée → déconnexion, et échoue à la moindre violation CSP
    Mailgun (SPF, DKIM, MX), puis créez une *Route* `match_recipient(".*@agents.mondomaine.fr")` →
    `forward("https://app.mondomaine.fr/api/webhooks/inbound")`. Renseignez `MAIL_PROVIDER=mailgun`,
    `MAILGUN_API_KEY`, `MAILGUN_WEBHOOK_SIGNING_KEY`, `MAIL_DOMAIN`.
-2. **Stripe (mode test d'abord)** : créez deux prix mensuels récurrents (Pro, Scale), copiez leurs
-   identifiants dans `STRIPE_PRICE_PRO` / `STRIPE_PRICE_SCALE`, ajoutez un endpoint webhook vers
-   `/api/webhooks/stripe` avec les événements `checkout.session.completed`,
-   `customer.subscription.created|updated|deleted`, puis `STRIPE_WEBHOOK_SECRET`. Activez le portail client.
-   En local : `stripe listen --forward-to localhost:3000/api/webhooks/stripe`.
+2. **Paiement par virement** : renseignez `BANK_ACCOUNT_HOLDER`, `BANK_IBAN` et `BANK_BIC` (votre compte Deblock,
+   par exemple) et `ADMIN_EMAILS` (votre email de connexion). Le client commande un plan, reçoit l'IBAN, le montant
+   et une référence `ANCRE-XXXXXXXX` à mettre dans le libellé. Quand le virement apparaît sur votre compte, ouvrez
+   **Paiements à valider** dans la console et cliquez sur « Virement reçu » : le plan est activé pour 1 mois. Une
+   commande impayée est annulée après 14 jours.
 3. **Hébergement** : image Docker fournie (utilisateur non-root, healthcheck `/api/health`), ou Vercel /
    Railway / Fly avec une base PostgreSQL managée. Servez **uniquement en HTTPS**.
 4. **Plusieurs instances** : remplacez le limiteur en mémoire (`src/lib/rate-limit.ts`) par Redis.
@@ -109,12 +110,12 @@ src/
     request-auth.ts        authentification API (clé Bearer ou session) + quota de débit
     inboxes.ts             logique métier boîtes / messages / quotas / réception
     users.ts               inscription, connexion, verrouillage, vérification d'email
-    billing.ts             Stripe Checkout, portail, webhooks idempotents
+    billing.ts             commandes par virement, validation admin, expiration des plans
     mail/                  adaptateurs fournisseur : mock (dev/tests) et Mailgun
   app/
     api/v1/...             API publique
-    api/console/...        clés API et facturation (session uniquement)
-    api/webhooks/...       Stripe et réception d'emails
+    api/console/...        clés API, commandes, validation admin (session uniquement)
+    api/webhooks/...       réception d'emails
     dashboard/...          console
 prisma/schema.prisma       modèle de données
 tests/                     unitaires + intégration (base PostgreSQL réelle)
