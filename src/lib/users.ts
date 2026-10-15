@@ -74,7 +74,8 @@ export async function sendVerificationEmail(userId: string, email: string) {
   } catch (err) {
     console.error("[verify] envoi impossible", err);
   }
-  if (env().NODE_ENV === "development") console.info(`[verify] lien de vérification (dev) : ${link}`);
+  // Fournisseur factice : aucun email ne part, le lien est écrit dans les journaux du serveur (visibles du seul propriétaire).
+  if (env().MAIL_PROVIDER === "mock" && env().NODE_ENV !== "test") console.info(`[verify] lien de vérification : ${link}`);
   return token;
 }
 

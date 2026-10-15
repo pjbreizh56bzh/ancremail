@@ -54,7 +54,7 @@ npx prisma migrate deploy
 npm run dev                       # http://localhost:3000
 ```
 
-En développement, le lien de vérification d'email s'affiche dans le terminal (fournisseur `mock`).
+Avec le fournisseur `mock`, aucun email ne part : le lien de vérification s'affiche dans les journaux du serveur (terminal en local, « Runtime Logs » sur Vercel).
 
 Avec Docker uniquement : `cp .env.example .env && docker compose up --build`.
 
