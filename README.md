@@ -95,6 +95,10 @@ tentative CSRF bloquée → commande par virement validée par l'admin → déco
    commande impayée est annulée après 14 jours.
 3. **Hébergement** : image Docker fournie (utilisateur non-root, healthcheck `/api/health`), ou Vercel /
    Railway / Fly avec une base PostgreSQL managée. Servez **uniquement en HTTPS**.
+   *Netlify* (version de test actuelle) : reliez le dépôt GitHub au projet, déclarez les variables dans
+   Project configuration › Environment variables, puis redéployez (une variable modifiée ne s'applique qu'au
+   déploiement suivant). Avec Supabase, utilisez l'adresse du pooler donnée par **Connect** dans Supabase
+   (`aws-1-…` pour les projets récents ; `aws-0-…` répond « tenant not found »).
 4. **Plusieurs instances** : remplacez le limiteur en mémoire (`src/lib/rate-limit.ts`) par Redis.
 5. **Secrets** : uniquement en variables d'environnement, jamais dans le dépôt (`.env` est ignoré par git).
 
